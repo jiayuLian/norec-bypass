@@ -1,6 +1,6 @@
 Package: com.nrc.norecbypass
 Name: NoRecBypass
-Version: 1.0.2
+Version: 1.0.3
 Architecture: iphoneos-arm
 Description: 抖音小程序「多来看点」录屏限制绕过 + 进程内流量取证（TrollFools 注入）
 Maintainer: NRC

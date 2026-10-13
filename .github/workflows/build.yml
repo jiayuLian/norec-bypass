@@ -116,10 +116,39 @@ jobs:
             *) echo "::error::产物不是 dylib（很可能拷成了 dSYM）"; exit 1 ;;
           esac
 
+      - name: 编译 Stub（空壳诊断 dylib）
+        run: |
+          set -e
+          # 这个 dylib 用来做「一刀切」诊断：
+          #   注入它抖音仍闪退 -> 问题在注入本身（反注入/重签/substrate 依赖）
+          #   注入它抖音正常   -> 问题在我们的 hook 代码
+          # 内容只有一个裸 write(2)，所以直接用 clang 编，不走 Theos。
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc -O2 \
+            -o out/NrcStub.dylib Stub.m
+          echo "--- file ---"
+          file -b out/NrcStub.dylib
+          echo "--- 加载命令 ---"
+          otool -L out/NrcStub.dylib
+          if otool -L out/NrcStub.dylib | grep -qi 'substrate'; then
+            echo "::error::Stub 不该有任何 substrate 依赖"
+            exit 1
+          fi
+          case "$(file -b out/NrcStub.dylib)" in
+            *"dynamically linked shared library"*) echo "OK: MH_DYLIB" ;;
+            *) echo "::error::Stub 不是 dylib"; exit 1 ;;
+          esac
+          ldid -S out/NrcStub.dylib || echo "ldid 跳过（TrollFools 注入时会重签）"
+          ls -l out/
+
       - uses: actions/upload-artifact@v4
         with:
           name: NoRecBypass-${{ env.NRC_VER }}-dylib
-          path: out/NoRecBypass.dylib
+          path: out/*.dylib
           if-no-files-found: error
 
       - name: 发 Release（手机可直接下载）
@@ -127,9 +156,22 @@ jobs:
         with:
           tag_name: dylib-latest
           name: NoRecBypass ${{ env.NRC_VER }}
-          files: out/NoRecBypass.dylib
+          files: |
+            out/NoRecBypass.dylib
+            out/NrcStub.dylib
           fail_on_unmatched_files: true
           body: |
             NoRecBypass ${{ env.NRC_VER }} —— 抖音小程序录屏限制绕过 + 进程内流量取证。
+
+            两个文件，用途不同：
+
+            * `NoRecBypass.dylib` —— 主程序（v${{ env.NRC_VER }} 加固版）
+              修复了 v1.0.2 的崩溃 BUG：class cluster 多类 hook 时原始实现串线。
+              并把所有 hook 从 dyld 加载期推迟到 App 启动后分三级安装。
+
+            * `NrcStub.dylib` —— 空壳诊断用
+              里面只有一个裸 write(2)，没有任何 hook / ObjC 调用。
+              如果注入它抖音也闪退，说明问题出在「注入」这一步本身，
+              而不是我们的代码，请对照 README 的诊断流程排查。
 
             注入方式：TrollFools → 抖音 → 注入 dylib。
