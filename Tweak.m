@@ -82,7 +82,7 @@
 #import <time.h>
 #import <errno.h>
 
-#define NRC_VERSION        @"1.0.5"
+#define NRC_VERSION        @"1.0.6"
 #define NRC_PORT           8899
 #define NRC_URL_MAX        5000
 #define NRC_BODY_MAX       200

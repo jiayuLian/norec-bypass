@@ -180,13 +180,21 @@ jobs:
           build_one Lite.m out/NrcLite0.dylib    -DNRC_MODE=0
           build_one Lite.m out/NrcLite.dylib     -DNRC_MODE=1
           build_one Lite.m out/NrcLiteLate.dylib -DNRC_MODE=2
-          echo "--- 校验三个 Lite 的模式标记 ---"
-          for f in out/NrcLite0.dylib out/NrcLite.dylib out/NrcLiteLate.dylib; do
-            if ! grep -aq 'NrcLite/1.0.5/mode=' "$f"; then
-              echo "::error::$f 里找不到模式标记，可能编错源文件"
+
+          # ---- NrcTrace 取证版：沿用 NrcLiteLate 验证过的 +3s 时机，只加取证 ----
+          #   av=0 → isCaptured 调用栈 + NSURLProtocol 明文 + HTTP 日志服务
+          #   av=1 → 再加 AVURLAsset / AVPlayerItem 两个入口，直取播放地址
+          build_one Trace.m out/NrcTrace.dylib    -DNRC_AV=0
+          build_one Trace.m out/NrcTraceAV.dylib  -DNRC_AV=1
+
+          echo "--- 校验 Lite / Trace 的标记 ---"
+          for f in out/NrcLite0.dylib out/NrcLite.dylib out/NrcLiteLate.dylib \
+                   out/NrcTrace.dylib out/NrcTraceAV.dylib; do
+            if ! grep -aq 'NrcLite/1.0.5/mode=' "$f" && ! grep -aq 'NrcTrace/1.0.6/av=' "$f"; then
+              echo "::error::$f 里找不到标记，可能编错源文件"
               exit 1
             fi
-            printf '%-26s ' "$f"; strings "$f" | grep -m1 'NrcLite/1.0.5/mode='
+            printf '%-26s ' "$f"; strings "$f" | grep -m1 -E 'Nrc(Lite|Trace)/'
           done
           ls -l out/
 
@@ -208,33 +216,42 @@ jobs:
             out/NrcLite0.dylib
             out/NrcLite.dylib
             out/NrcLiteLate.dylib
+            out/NrcTrace.dylib
+            out/NrcTraceAV.dylib
           fail_on_unmatched_files: true
           body: |
-            NoRecBypass ${{ env.NRC_VER }} —— 抖音小程序录屏限制绕过 + 进程内流量取证。
+            NoRecBypass ${{ env.NRC_VER }}
 
-            ## ⚠️ 先看这个：注入抖音闪退，请改用 NrcLite 三梯度包
+            ## 现在只用这两个
 
-            已知：`NrcStub.dylib` 注入正常，`NoRecBypass.dylib` 注入闪退。
-            两者之间差的不止一样东西（Theos 工具链 / UIKit 链接 / 全量类清扫 /
-            NSURLSession hook / socket 服务），所以一次改一堆定位不到。
+            * **`NrcLiteLate.dylib`** —— 录屏绕过，**已实测可用**。
+              clang 直编、只链 Foundation、App 起来 +3s 后装一个 hook
+              `-[UIScreen isCaptured] → NO`。
 
-            `NrcLite*` 把差异压到极限：**clang 直编、不经 Theos、只链 Foundation、
-            只 hook 一个方法 `-[UIScreen isCaptured]`**。三个梯度：
+            * **`NrcTrace.dylib`** / **`NrcTraceAV.dylib`** —— 取证版（新）。
+              沿用同一个 +3s 边界，只加取证、不改行为：
+              - `[A]` 把 `isCaptured` 的**调用栈**打出来 → 到底是谁在判断录屏
+              - `[B]` 注册 `NSURLProtocol`（官方扩展点，**零 swizzle**）→ 抓所有走
+                系统网络栈的请求 URL / 请求头 / 响应体
+              - `[C]`（仅 AV 版）hook `AVURLAsset URLAssetWithURL:options:` 与
+                `AVPlayerItem initWithURL:` → 直接拿到播放器要放的 URL
+              - `[D]` 内建 HTTP 日志服务：电脑浏览器打开 `http://<手机IP>:8899/`
+                实时看，不用找文件
+              `NrcTrace.dylib` 不带 `[C]`，最保守，先试它。
 
-            | 文件 | 行为 | 崩了说明什么 | 正常说明什么 |
-            |---|---|---|---|
-            | `NrcLite0.dylib` | 完全不装 hook | 连 Foundation/ObjC 链接都不行 | 加载路径没问题 |
-            | `NrcLite.dylib` | 构造期就装 hook | 抖音启动早期就因「系统类被改」而死 | 早装可行 ✅ |
-            | `NrcLiteLate.dylib` | App 起来 +3s 才装 | 抖音的完整性校验在启动之后 | 晚装可行 ✅ |
+            ## 关键结论（诊断过程留下的）
 
-            只要有一个能跑，录屏绕过这件事就成立了，剩下的都是加法。
+            三个 Lite 包唯一的差别是**安装时机**。+3s 那个才活 ⇒ 抖音启动期有一段
+            自检窗口，窗口内 swizzle 系统类会被反篡改主动终止；App 完全起来之后再
+            动手就没人管。v1.0.2~v1.0.4 全崩，就是因为加载期动手 + 一次改几十个类
+            + 全量类清扫 + 开 socket，在抖音最警觉的时刻干了最响的事。
 
-            ## 五个/六个文件，用途一览
+            ## 其余文件
 
-            * `NrcLite0.dylib` / `NrcLite.dylib` / `NrcLiteLate.dylib` —— 见上表，**优先试这三个**
-            * `NoRecBypass.dylib` —— 完整版主程序（录屏绕过 + 网络取证 + HTTP 日志服务）
-            * `NrcProbe.dylib` —— 阶梯式诊断版，日志 `[P0]`~`[P7]`，看停在哪一级
-            * `NrcStub.dylib` —— 空壳，只有一个裸 `write(2)`，对照用
+            * `NrcLite0.dylib` (mode=0) / `NrcLite.dylib` (mode=1) —— 梯度对照，诊断用
+            * `NrcProbe.dylib` —— 阶梯诊断版，日志 `[P0]`~`[P7]`
+            * `NrcStub.dylib` —— 空壳，只有一个裸 `write(2)`
+            * `NoRecBypass.dylib` —— 完整版（含网络取证 + socket 服务），**注入抖音会闪退**
 
-            全部产物都已 `ldid -S` ad-hoc 签名（缺 `LC_CODE_SIGNATURE` 会被 iOS 拒载）。
-            注入方式：TrollFools → 抖音 → 注入 dylib，每次换包前先 Uninject 再完整杀进程。
+            全部产物均已 `ldid -S` ad-hoc 签名。
+            每次换包前先 Uninject，再完整杀掉进程。
