@@ -1,0 +1,135 @@
+name: build
+
+# 产出：NoRecBypass.dylib —— 用 TrollFools 注入抖音
+#
+# 为什么跑在 macos-latest：Windows 上没有 clang / iPhoneOS SDK，
+# 只能借 macOS runner 用 Xcode 自带工具链编（一次过，不用自己搭 Linux 交叉链）。
+#
+# 注意：public 仓库的 macOS runner 免费无限；private 仓库要烧付费额度。
+# 所以这个仓库保持 public。
+#
+# 链接依赖（实际由 Makefile 的 NoRecBypass_FRAMEWORKS 指定，这里同步一份给静态检查）：
+#   -framework Foundation
+# UIKit / AVFoundation 的类一律走 NSClassFromString，不做符号引用，故不链。
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  dylib:
+    name: 编译 dylib
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Theos + iOS SDK + ldid
+        run: |
+          set -e
+          export THEOS="$HOME/theos"
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$THEOS"
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+          mkdir -p "$THEOS/sdks"
+          cp -r /tmp/theos-sdks/iPhoneOS*.sdk "$THEOS/sdks/"
+          echo "--- sdks ---"; ls -1 "$THEOS/sdks"
+          echo "--- xcode ---"; xcodebuild -version
+          echo "--- clang ---"; clang --version | head -2
+
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid || {
+              mkdir -p "$HOME/bin"
+              for a in ldid_macosx_arm64 ldid_macosx_universal ldid_macosx_x86_64; do
+                if curl -fsSL -o "$HOME/bin/ldid" \
+                   "https://github.com/ProcursusTeam/ldid/releases/latest/download/$a"; then
+                  chmod +x "$HOME/bin/ldid"; break
+                fi
+              done
+              echo "$HOME/bin" >> "$GITHUB_PATH"
+            }
+          fi
+          echo "--- ldid ---"
+          command -v ldid && (ldid -h 2>&1 | head -2 || true)
+
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+          echo "$THEOS/bin" >> "$GITHUB_PATH"
+
+      - name: 版本号
+        run: |
+          set -e
+          VER=$(python3 -c "import re;m=re.search(r'NRC_VERSION\s+@\"([^\"]+)\"',open('Tweak.m',encoding='utf-8').read());print(m.group(1) if m else '')")
+          if [ -z "$VER" ]; then echo "::error::Tweak.m 里找不到 NRC_VERSION"; exit 1; fi
+          echo "NRC_VER=$VER" >> "$GITHUB_ENV"
+          echo "版本 = $VER"
+
+      - name: 编译
+        run: |
+          set -e
+          make clean || true
+          make -j"$(sysctl -n hw.ncpu)" || {
+            echo "::warning::make 失败，列出 .theos 残留"
+            find .theos -name '*.dylib*' -exec ls -l {} \; || true
+            exit 1
+          }
+          echo "--- 产物 ---"
+          find .theos -type f -name '*NoRecBypass*.dylib' -not -path '*.dSYM/*' -exec ls -l {} \;
+
+          DYLIB=$(find .theos -type f -name '*NoRecBypass*.dylib' -not -path '*.dSYM/*' | head -1)
+          echo "--- 文件类型（必须是 dynamically linked shared library）---"
+          file -b "$DYLIB"
+          echo "--- 加载命令 ---"
+          otool -L "$DYLIB"
+
+          # 硬闸：TrollStore/TrollFools 不是越狱，设备上不存在 CydiaSubstrate。
+          # dylib 只要带这条依赖，dyld 加载期直接失败、抖音起不来。
+          if otool -L "$DYLIB" | grep -qi 'substrate'; then
+            echo "::error::dylib 仍依赖 CydiaSubstrate —— 检查是否混进了 Logos 代码"
+            exit 1
+          fi
+          echo "OK: 无 substrate 依赖"
+
+          # 版本断言：确认编的确实是当前 Tweak.m，不是旧缓存
+          if ! grep -aq "NRC_VERSION" "$DYLIB" && ! grep -aq "$NRC_VER" "$DYLIB"; then
+            echo "::error::dylib 内找不到版本标记"
+            exit 1
+          fi
+          echo "OK: 版本标记已在 dylib 内"
+
+      - name: 收集 dylib
+        run: |
+          set -e
+          mkdir -p out
+          # 坑：dSYM bundle 里也有同名文件（filetype 10，不是 dylib），必须排除
+          DYLIB=$(find .theos -type f -name '*NoRecBypass*.dylib' -not -path '*.dSYM/*' | head -1)
+          if [ -z "$DYLIB" ]; then
+            echo "::error::没找到 NoRecBypass.dylib"
+            find .theos -name '*NoRecBypass*' -exec ls -l {} \;
+            exit 1
+          fi
+          cp "$DYLIB" out/NoRecBypass.dylib
+          ls -l out/
+          case "$(file -b out/NoRecBypass.dylib)" in
+            *"dynamically linked shared library"*) echo "OK: MH_DYLIB" ;;
+            *) echo "::error::产物不是 dylib（很可能拷成了 dSYM）"; exit 1 ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NoRecBypass-${{ env.NRC_VER }}-dylib
+          path: out/NoRecBypass.dylib
+          if-no-files-found: error
+
+      - name: 发 Release（手机可直接下载）
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dylib-latest
+          name: NoRecBypass ${{ env.NRC_VER }}
+          files: out/NoRecBypass.dylib
+          fail_on_unmatched_files: true
+          body: |
+            NoRecBypass ${{ env.NRC_VER }} —— 抖音小程序录屏限制绕过 + 进程内流量取证。
+
+            注入方式：TrollFools → 抖音 → 注入 dylib。
