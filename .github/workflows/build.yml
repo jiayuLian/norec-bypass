@@ -149,11 +149,12 @@ jobs:
           echo "SDK=$SDK"
 
           build_one () {
-            SRC="$1"; OUT="$2"
+            SRC="$1"; OUT="$2"; shift 2
             xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
               -isysroot "$SDK" \
               -miphoneos-version-min=14.0 \
               -fobjc-arc -O2 \
+              "$@" \
               -framework Foundation \
               -o "$OUT" "$SRC"
             echo "--- $OUT ---"
@@ -173,6 +174,20 @@ jobs:
 
           build_one Stub.m  out/NrcStub.dylib
           build_one Probe.m out/NrcProbe.dylib
+
+          # ---- NrcLite 三梯度：把「工具链」这个变量也换掉（clang 直编，不经 Theos）----
+          #   0 = 不装 hook      1 = 构造期装      2 = +3s 装
+          build_one Lite.m out/NrcLite0.dylib    -DNRC_MODE=0
+          build_one Lite.m out/NrcLite.dylib     -DNRC_MODE=1
+          build_one Lite.m out/NrcLiteLate.dylib -DNRC_MODE=2
+          echo "--- 校验三个 Lite 的模式标记 ---"
+          for f in out/NrcLite0.dylib out/NrcLite.dylib out/NrcLiteLate.dylib; do
+            if ! grep -aq 'NrcLite/1.0.5/mode=' "$f"; then
+              echo "::error::$f 里找不到模式标记，可能编错源文件"
+              exit 1
+            fi
+            printf '%-26s ' "$f"; strings "$f" | grep -m1 'NrcLite/1.0.5/mode='
+          done
           ls -l out/
 
       - uses: actions/upload-artifact@v4
@@ -190,48 +205,36 @@ jobs:
             out/NoRecBypass.dylib
             out/NrcStub.dylib
             out/NrcProbe.dylib
+            out/NrcLite0.dylib
+            out/NrcLite.dylib
+            out/NrcLiteLate.dylib
           fail_on_unmatched_files: true
           body: |
             NoRecBypass ${{ env.NRC_VER }} —— 抖音小程序录屏限制绕过 + 进程内流量取证。
 
-            ## v${{ env.NRC_VER }} 修了什么
+            ## ⚠️ 先看这个：注入抖音闪退，请改用 NrcLite 三梯度包
 
-            **补上了 ad-hoc 代码签名（`ldid -S`）**。
+            已知：`NrcStub.dylib` 注入正常，`NoRecBypass.dylib` 注入闪退。
+            两者之间差的不止一样东西（Theos 工具链 / UIKit 链接 / 全量类清扫 /
+            NSURLSession hook / socket 服务），所以一次改一堆定位不到。
 
-            Theos 产出的 dylib 默认没有 `LC_CODE_SIGNATURE` 加载命令。对比体检发现：
+            `NrcLite*` 把差异压到极限：**clang 直编、不经 Theos、只链 Foundation、
+            只 hook 一个方法 `-[UIScreen isCaptured]`**。三个梯度：
 
-            | | NoRecBypass ≤1.0.3 | NrcStub（能跑） |
-            |---|---|---|
-            | `LC_CODE_SIGNATURE` | **无** | **有** |
-            | SDK 26.5 / platform iOS / minos 14.0 / arm64 | 相同 | 相同 |
+            | 文件 | 行为 | 崩了说明什么 | 正常说明什么 |
+            |---|---|---|---|
+            | `NrcLite0.dylib` | 完全不装 hook | 连 Foundation/ObjC 链接都不行 | 加载路径没问题 |
+            | `NrcLite.dylib` | 构造期就装 hook | 抖音启动早期就因「系统类被改」而死 | 早装可行 ✅ |
+            | `NrcLiteLate.dylib` | App 起来 +3s 才装 | 抖音的完整性校验在启动之后 | 晚装可行 ✅ |
 
-            签名缺失是两者唯一的结构性差异。未签名的 dylib 在 iOS 上会被签名校验
-            拒绝加载，dyld 失败 → 宿主直接闪退。v${{ env.NRC_VER }} 起全部签名。
+            只要有一个能跑，录屏绕过这件事就成立了，剩下的都是加法。
 
-            另外日志在 App 起来后（+2s）会双写一份到 `NSLog`，电脑上跑
-            `idevicesyslog`（或爱思助手/3uTools 的「实时日志」）就能实时看到，
-            崩溃前最后一行会留在屏幕上。
+            ## 五个/六个文件，用途一览
 
-            ## 三个文件，用途不同
+            * `NrcLite0.dylib` / `NrcLite.dylib` / `NrcLiteLate.dylib` —— 见上表，**优先试这三个**
+            * `NoRecBypass.dylib` —— 完整版主程序（录屏绕过 + 网络取证 + HTTP 日志服务）
+            * `NrcProbe.dylib` —— 阶梯式诊断版，日志 `[P0]`~`[P7]`，看停在哪一级
+            * `NrcStub.dylib` —— 空壳，只有一个裸 `write(2)`，对照用
 
-            * `NoRecBypass.dylib` —— 主程序（v${{ env.NRC_VER }}）
-              录屏限制绕过 + 进程内流量取证。分级安装（+2s / +6s / +14s），
-              带启动自保护（连续 2 次崩就自动切最小模式）。
-
-            * `NrcProbe.dylib` —— 阶梯式诊断版
-              每一级只做一件事并打日志 `[P0]`~`[P7]`。主程序还崩的话就用它，
-              看日志最后停在哪一级即可定位崩点：
-              ```
-              只看到 [P0]  -> dyld 加载期就被拒（签名/依赖）
-              停在 [P2]    -> hook UIScreen 有问题
-              停在 [P3]    -> hook NSNotificationCenter 有问题
-              停在 [P4]    -> hook NSURLSession 有问题
-              停在 [P5]    -> hook AVFoundation 有问题
-              停在 [P6]    -> 全量类扫描有问题
-              看到 [P7]    -> hook 代码干净，问题在别处
-              ```
-
-            * `NrcStub.dylib` —— 空壳
-              只有一个裸 `write(2)`。注入它仍闪退 ⇒ 问题在注入这一步本身。
-
-            注入方式：TrollFools → 抖音 → 注入 dylib。
+            全部产物都已 `ldid -S` ad-hoc 签名（缺 `LC_CODE_SIGNATURE` 会被 iOS 拒载）。
+            注入方式：TrollFools → 抖音 → 注入 dylib，每次换包前先 Uninject 再完整杀进程。

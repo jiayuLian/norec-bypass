@@ -2,7 +2,12 @@
  * NoRecBypass (NRC) — 抖音小程序「多来看点」录屏限制绕过 + 进程内流量取证
  *
  * 目标设备：iPhone · iOS 15.4.1 · TrollStore（非越狱）· 注入宿主 = 抖音
- * 版本：1.0.3（针对「注入后打开闪退」的加固版）
+ * 版本：1.0.5（针对「注入后打开闪退」的加固版）
+ *
+ * 【重要】如果你的抖音注入本文件产物仍然闪退，请改用同仓库的 NrcLite 三梯度包
+ *   NrcLite0 / NrcLite / NrcLiteLate —— 那是把变量压到极限的定位版。
+ *   本文件包含全量类清扫 + NSURLSession hook + socket 服务，是最「重」的包，
+ *   在抖音这种带完整性校验的 App 上不一定能活。
  *
  * ── 为什么不用 Logos ──────────────────────────────────────────────────────
  * Logos 的 %hook 会生成对 MSHookMessageEx / MSGetImageByName 的引用，于是 dylib
@@ -77,7 +82,7 @@
 #import <time.h>
 #import <errno.h>
 
-#define NRC_VERSION        @"1.0.4"
+#define NRC_VERSION        @"1.0.5"
 #define NRC_PORT           8899
 #define NRC_URL_MAX        5000
 #define NRC_BODY_MAX       200
