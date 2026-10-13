@@ -77,7 +77,7 @@
 #import <time.h>
 #import <errno.h>
 
-#define NRC_VERSION        @"1.0.3"
+#define NRC_VERSION        @"1.0.4"
 #define NRC_PORT           8899
 #define NRC_URL_MAX        5000
 #define NRC_BODY_MAX       200
@@ -115,6 +115,13 @@ static void      NrcNoteResponse(NSURLRequest *req, NSURLResponse *resp, NSData 
  * ==================================================================== */
 
 static char gLogPath[1024] = {0};
+
+/* 日志双写开关：加 App 起来之后才打开（+2s）。
+   constructor 跑在 dyld 加载期，那会儿连一行 ObjC 都不能碰，所以只写文件；
+   到了 Stage1，同一行内容再走一遍 NSLog —— 这样电脑上跑 idevicesyslog
+   （或爱思助手/3uTools 的「实时日志」）就能同步看到。
+   进程即使随后崩掉，崩溃前的最后一行也已经打在电脑屏幕上了。 */
+static volatile int gNsLogOn = 0;
 
 static void NrcInitLogPath(void) {
     if (gLogPath[0] != '\0') {
@@ -163,6 +170,14 @@ static void NrcLogC(const char *fmt, ...) {
         (void)w;
         fsync(fd);              /* 关键：崩溃前最后一行必须已在磁盘上 */
         close(fd);
+    }
+
+    /* 双写：+2s 之后同一行也丢给 NSLog，电脑上的实时日志就能看到 */
+    if (gNsLogOn != 0) {
+        NSString *line = [NSString stringWithUTF8String:buf];
+        if (line != nil) {
+            NSLog(@"[NRC] %@", line);
+        }
     }
 }
 
@@ -1012,6 +1027,7 @@ static void NrcStartHttpServer(void) {
  * ========================================================== */
 
 static void NrcStage1(void) {
+    gNsLogOn = 1;   /* App 已经起来了，从这里开始日志双写走 NSLog，电脑实时可见 */
     NrcLogC("[STAGE1] >>> 开始：录屏检测绕过（最小可用集）");
 
     @try {

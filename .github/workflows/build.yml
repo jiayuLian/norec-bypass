@@ -116,33 +116,63 @@ jobs:
             *) echo "::error::产物不是 dylib（很可能拷成了 dSYM）"; exit 1 ;;
           esac
 
-      - name: 编译 Stub（空壳诊断 dylib）
-        run: |
-          set -e
-          # 这个 dylib 用来做「一刀切」诊断：
-          #   注入它抖音仍闪退 -> 问题在注入本身（反注入/重签/substrate 依赖）
-          #   注入它抖音正常   -> 问题在我们的 hook 代码
-          # 内容只有一个裸 write(2)，所以直接用 clang 编，不走 Theos。
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "SDK=$SDK"
-          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
-            -isysroot "$SDK" \
-            -miphoneos-version-min=14.0 \
-            -fobjc-arc -O2 \
-            -o out/NrcStub.dylib Stub.m
-          echo "--- file ---"
-          file -b out/NrcStub.dylib
-          echo "--- 加载命令 ---"
-          otool -L out/NrcStub.dylib
-          if otool -L out/NrcStub.dylib | grep -qi 'substrate'; then
-            echo "::error::Stub 不该有任何 substrate 依赖"
+          # ---------------------------------------------------------------
+          # 【必须】ad-hoc 代码签名。
+          #
+          # Theos 产出的 dylib 默认【没有】LC_CODE_SIGNATURE 这条加载命令。
+          # 而未签名的 dylib 在 iOS 上会被签名校验直接拒掉，dyld 加载失败
+          # → 宿主（抖音）秒退。
+          #
+          # 这正是「NrcStub（签过 ldid）能跑、NoRecBypass（没签）闪退」
+          # 的唯一结构性差异：
+          #   NoRecBypass v1.0.2/v1.0.3 : LC_CODE_SIGNATURE = 无
+          #   NrcStub                  : LC_CODE_SIGNATURE = 有
+          # 其余（SDK 26.5 / platform iOS / minos 14.0 / arm64）完全一致。
+          # ---------------------------------------------------------------
+          ldid -S out/NoRecBypass.dylib
+          if ! otool -l out/NoRecBypass.dylib | grep -q LC_CODE_SIGNATURE; then
+            echo "::error::签名后仍然没有 LC_CODE_SIGNATURE，抖音注入后会被拒"
             exit 1
           fi
-          case "$(file -b out/NrcStub.dylib)" in
-            *"dynamically linked shared library"*) echo "OK: MH_DYLIB" ;;
-            *) echo "::error::Stub 不是 dylib"; exit 1 ;;
-          esac
-          ldid -S out/NrcStub.dylib || echo "ldid 跳过（TrollFools 注入时会重签）"
+          echo "OK: 已签名（LC_CODE_SIGNATURE 存在）"
+
+      - name: 编译诊断 dylib（NrcStub + NrcProbe）
+        run: |
+          set -e
+          # 这两个都是「一次注入就能定位问题」用的：
+          #   NrcStub  —— 全文件只有一个裸 write(2)。注入它仍闪退 ⇒ 问题在注入本身。
+          #   NrcProbe —— 阶梯式，每一级只做一件事并打日志（[P0]~[P7]）。
+          #               看日志最后停在哪一级，就知道崩点在哪。
+          # 两者都用 clang 直接编（不走 Theos），且都必须 ldid 签名 —— 不加
+          # LC_CODE_SIGNATURE 的话 iOS 会拒绝加载，那就白测了。
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK=$SDK"
+
+          build_one () {
+            SRC="$1"; OUT="$2"
+            xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+              -isysroot "$SDK" \
+              -miphoneos-version-min=14.0 \
+              -fobjc-arc -O2 \
+              -framework Foundation \
+              -o "$OUT" "$SRC"
+            echo "--- $OUT ---"
+            file -b "$OUT"
+            otool -L "$OUT"
+            if otool -L "$OUT" | grep -qi 'substrate'; then
+              echo "::error::$OUT 不该有任何 substrate 依赖"
+              exit 1
+            fi
+            ldid -S "$OUT"
+            if ! otool -l "$OUT" | grep -q LC_CODE_SIGNATURE; then
+              echo "::error::$OUT 签名失败，缺少 LC_CODE_SIGNATURE"
+              exit 1
+            fi
+            echo "OK: $OUT 已签名"
+          }
+
+          build_one Stub.m  out/NrcStub.dylib
+          build_one Probe.m out/NrcProbe.dylib
           ls -l out/
 
       - uses: actions/upload-artifact@v4
@@ -159,19 +189,49 @@ jobs:
           files: |
             out/NoRecBypass.dylib
             out/NrcStub.dylib
+            out/NrcProbe.dylib
           fail_on_unmatched_files: true
           body: |
             NoRecBypass ${{ env.NRC_VER }} —— 抖音小程序录屏限制绕过 + 进程内流量取证。
 
-            两个文件，用途不同：
+            ## v${{ env.NRC_VER }} 修了什么
 
-            * `NoRecBypass.dylib` —— 主程序（v${{ env.NRC_VER }} 加固版）
-              修复了 v1.0.2 的崩溃 BUG：class cluster 多类 hook 时原始实现串线。
-              并把所有 hook 从 dyld 加载期推迟到 App 启动后分三级安装。
+            **补上了 ad-hoc 代码签名（`ldid -S`）**。
 
-            * `NrcStub.dylib` —— 空壳诊断用
-              里面只有一个裸 write(2)，没有任何 hook / ObjC 调用。
-              如果注入它抖音也闪退，说明问题出在「注入」这一步本身，
-              而不是我们的代码，请对照 README 的诊断流程排查。
+            Theos 产出的 dylib 默认没有 `LC_CODE_SIGNATURE` 加载命令。对比体检发现：
+
+            | | NoRecBypass ≤1.0.3 | NrcStub（能跑） |
+            |---|---|---|
+            | `LC_CODE_SIGNATURE` | **无** | **有** |
+            | SDK 26.5 / platform iOS / minos 14.0 / arm64 | 相同 | 相同 |
+
+            签名缺失是两者唯一的结构性差异。未签名的 dylib 在 iOS 上会被签名校验
+            拒绝加载，dyld 失败 → 宿主直接闪退。v${{ env.NRC_VER }} 起全部签名。
+
+            另外日志在 App 起来后（+2s）会双写一份到 `NSLog`，电脑上跑
+            `idevicesyslog`（或爱思助手/3uTools 的「实时日志」）就能实时看到，
+            崩溃前最后一行会留在屏幕上。
+
+            ## 三个文件，用途不同
+
+            * `NoRecBypass.dylib` —— 主程序（v${{ env.NRC_VER }}）
+              录屏限制绕过 + 进程内流量取证。分级安装（+2s / +6s / +14s），
+              带启动自保护（连续 2 次崩就自动切最小模式）。
+
+            * `NrcProbe.dylib` —— 阶梯式诊断版
+              每一级只做一件事并打日志 `[P0]`~`[P7]`。主程序还崩的话就用它，
+              看日志最后停在哪一级即可定位崩点：
+              ```
+              只看到 [P0]  -> dyld 加载期就被拒（签名/依赖）
+              停在 [P2]    -> hook UIScreen 有问题
+              停在 [P3]    -> hook NSNotificationCenter 有问题
+              停在 [P4]    -> hook NSURLSession 有问题
+              停在 [P5]    -> hook AVFoundation 有问题
+              停在 [P6]    -> 全量类扫描有问题
+              看到 [P7]    -> hook 代码干净，问题在别处
+              ```
+
+            * `NrcStub.dylib` —— 空壳
+              只有一个裸 `write(2)`。注入它仍闪退 ⇒ 问题在注入这一步本身。
 
             注入方式：TrollFools → 抖音 → 注入 dylib。
