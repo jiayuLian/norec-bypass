@@ -119,7 +119,7 @@ static void nrc_install(void) {
         nrc_raw("!! objc_getClass(\"UIScreen\") 返回 NULL");
         return;
     }
-    nrc_raw("UIScreen = %p", (void *)cls);
+    nrc_raw("UIScreen = %p", (__bridge void *)cls);
 
     static const char *names[] = { "isCaptured", "_isCaptured" };
     for (int i = 0; i < 2; i++) {
